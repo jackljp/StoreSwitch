@@ -42,69 +42,118 @@ on ensureFront()
 	end tell
 end ensureFront
 
-on probeSheet()
+on findSheet()
+	-- The sign-in sheet is usually on window 1, but search every window to be safe.
 	tell application "System Events" to tell process "App Store"
 		try
-			if (count of sheets of window 1) is 0 then return {false, false, 0, 0}
-			set useInner to false
+			repeat with w in windows
+				if (count of sheets of w) > 0 then return sheet 1 of w
+			end repeat
+		end try
+	end tell
+	return missing value
+end findSheet
+
+on probeSheet()
+	-- Returns {sheetVisible, appleIDField, passwordField}. Fields are missing value when absent.
+	-- Newer macOS nests the fields several levels deep, so walk the whole sheet.
+	set sh to my findSheet()
+	if sh is missing value then return {false, missing value, missing value}
+	set idField to missing value
+	set secField to missing value
+	tell application "System Events"
+		try
+			set els to entire contents of sh
+		on error
+			return {true, missing value, missing value}
+		end try
+		repeat with e in els
+			set e to contents of e
+			set r to ""
 			try
-				if (count of text fields of (UI element 1 of sheet 1 of window 1)) > 0 then set useInner to true
+				set r to role of e as text
 			end try
-			if useInner then
-				set cont to UI element 1 of sheet 1 of window 1
-			else
-				set cont to sheet 1 of window 1
-			end if
-			set idIdx to 0
-			set secIdx to 0
-			set i to 0
-			repeat with tf in text fields of cont
-				set i to i + 1
-				-- AXSubrole is stable across locales. The description is localized
-				-- (for example, Chinese App Store reports “安全文本栏”).
-				set isSecureField to false
-				try
-					if (subrole of tf as text) is "AXSecureTextField" then set isSecureField to true
-				end try
+			if r is in {"AXTextField", "AXComboBox", "AXTextArea", "AXSecureTextField"} then
+				-- AXSubrole is stable across locales; the description is localized.
+				set isSecureField to (r is "AXSecureTextField")
 				if not isSecureField then
 					try
-						if (description of tf as text) is "secure text field" then set isSecureField to true
+						if (subrole of e as text) is "AXSecureTextField" then set isSecureField to true
+					end try
+				end if
+				if not isSecureField then
+					try
+						if (description of e as text) is in {"secure text field", "安全文本栏"} then set isSecureField to true
 					end try
 				end if
 				if isSecureField then
-					set secIdx to i
+					if secField is missing value then set secField to e
 				else
-					set idIdx to i
+					if idField is missing value then set idField to e
 				end if
-			end repeat
-			return {true, useInner, idIdx, secIdx}
-		on error
-			return {false, false, 0, 0}
-		end try
+			end if
+		end repeat
 	end tell
+	return {true, idField, secField}
 end probeSheet
 
-on typeInField(useInner, idx, txt, doSelectAll, shouldSubmit)
+on describeSheet()
+	-- Diagnostic only: control roles, never values or titles.
+	set sh to my findSheet()
+	if sh is missing value then return "no sheet"
+	set parts to {}
+	tell application "System Events"
+		try
+			set els to entire contents of sh
+			set n to 0
+			repeat with e in els
+				set n to n + 1
+				if n > 60 then exit repeat
+				set e to contents of e
+				set r to "?"
+				set sr to ""
+				try
+					set r to role of e as text
+				end try
+				try
+					set sr to subrole of e as text
+				end try
+				if sr is not "" and sr is not "missing value" then set r to r & "/" & sr
+				set end of parts to r
+			end repeat
+		on error errMsg
+			return "describe failed: " & errMsg
+		end try
+	end tell
+	set AppleScript's text item delimiters to ", "
+	set out to parts as text
+	set AppleScript's text item delimiters to ""
+	return out
+end describeSheet
+
+on typeInField(tf, txt, doSelectAll, shouldSubmit)
 	my ensureFront()
-	tell application "System Events" to tell process "App Store"
-		if useInner then
-			set cont to UI element 1 of sheet 1 of window 1
-		else
-			set cont to sheet 1 of window 1
-		end if
-		set tf to text field idx of cont
-		set focused of tf to true
+	tell application "System Events"
+		try
+			set focused of tf to true
+		end try
+		delay 0.2
+		try
+			if not (focused of tf) then click tf
+		end try
 		delay 0.3
-		if doSelectAll then
-			keystroke "a" using command down
-			delay 0.2
-		end if
-		keystroke txt
-		delay 0.3
-		if shouldSubmit then
-			key code 36
+		tell process "App Store"
+			if doSelectAll then
+				keystroke "a" using command down
+				delay 0.2
+			end if
+			keystroke txt
 			delay 0.3
-		end if
+			if shouldSubmit then
+				key code 36
+				delay 0.3
+			end if
+		end tell
 	end tell
 end typeInField
 
@@ -170,38 +219,41 @@ on run
 		end if
 	end tell
 
-	set probe to {false, false, 0, 0}
+	set probe to {false, missing value, missing value}
 	repeat 20 times
 		delay 0.5
 		set probe to my probeSheet()
 		if item 1 of probe then exit repeat
 	end repeat
 	if not (item 1 of probe) then error (my localizedText("App Store 登录窗口没有出现。", "The App Store sign-in window did not appear."))
-	delay 0.8
-	set probe to my probeSheet()
 
-	set useInner to item 2 of probe
-	set idIdx to item 3 of probe
-	set secIdx to item 4 of probe
-	if idIdx > 0 then
-		if secIdx is 0 then
-			my typeInField(useInner, idIdx, targetEmail, true, true)
+	-- Wait for the sheet's content to finish loading.
+	repeat 20 times
+		set probe to my probeSheet()
+		if (item 2 of probe is not missing value) or (item 3 of probe is not missing value) then exit repeat
+		delay 0.5
+	end repeat
+
+	set idField to item 2 of probe
+	set secField to item 3 of probe
+	if idField is not missing value then
+		if secField is missing value then
+			my typeInField(idField, targetEmail, true, true)
 			repeat 20 times
 				delay 0.5
 				set probe to my probeSheet()
-				if (item 1 of probe) and (item 4 of probe) > 0 then exit repeat
+				if (item 1 of probe) and (item 3 of probe is not missing value) then exit repeat
 			end repeat
-			if not ((item 1 of probe) and (item 4 of probe) > 0) then error (my localizedText("提交 Apple ID 后没有识别到密码框。", "The password field was not detected after submitting the Apple ID."))
+			if not ((item 1 of probe) and (item 3 of probe is not missing value)) then error (my localizedText("提交 Apple ID 后没有识别到密码框。", "The password field was not detected after submitting the Apple ID.") & " [" & my describeSheet() & "]")
 		else
-			my typeInField(useInner, idIdx, targetEmail, true, false)
+			my typeInField(idField, targetEmail, true, false)
 			set probe to my probeSheet()
 		end if
 	end if
 
-	set useInner to item 2 of probe
-	set secIdx to item 4 of probe
-	if secIdx is 0 then error (my localizedText("没有识别到 App Store 密码框。", "The App Store password field was not detected."))
-	my typeInField(useInner, secIdx, targetPassword, false, true)
+	set secField to item 3 of probe
+	if secField is missing value then error (my localizedText("没有识别到 App Store 密码框。", "The App Store password field was not detected.") & " [" & my describeSheet() & "]")
+	my typeInField(secField, targetPassword, false, true)
 
 	repeat 40 times
 		delay 0.5
